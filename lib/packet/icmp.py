@@ -188,7 +188,7 @@ class dest_unreach(object):
     ============== ====================
     """
 
-    _PACK_STR = '!BBH'
+    _PACK_STR = '!xBH'
     _MIN_LEN = struct.calcsize(_PACK_STR)
 
     def __init__(self, data_len=0, mtu=0, data=None):
@@ -199,8 +199,8 @@ class dest_unreach(object):
 
     @classmethod
     def parser(cls, buf, offset):
-        (unused, data_len, mtu) = struct.unpack_from(cls._PACK_STR,
-                                                     buf, offset)
+        (data_len, mtu) = struct.unpack_from(cls._PACK_STR,
+                                             buf, offset)
         msg = cls(data_len, mtu)
         offset += cls._MIN_LEN
 
@@ -210,9 +210,8 @@ class dest_unreach(object):
         return msg
 
     def serialize(self):
-        unused = 0
         hdr = bytearray(struct.pack(dest_unreach._PACK_STR,
-                        unused, self.data_len, self.mtu))
+                        self.data_len, self.mtu))
 
         if self.data is not None:
             hdr += self.data
@@ -241,7 +240,7 @@ class TimeExceeded(object):
     ============== ====================
     """
 
-    _PACK_STR = '!BBH'
+    _PACK_STR = '!xBxx'
     _MIN_LEN = struct.calcsize(_PACK_STR)
 
     def __init__(self, data_len=0, data=None):
@@ -250,8 +249,7 @@ class TimeExceeded(object):
 
     @classmethod
     def parser(cls, buf, offset):
-        (unused1, data_len, unused2) = struct.unpack_from(cls._PACK_STR,
-                                                          buf, offset)
+        data_len = struct.unpack_from(cls._PACK_STR, buf, offset)
         msg = cls(data_len)
         offset += cls._MIN_LEN
 
@@ -261,9 +259,7 @@ class TimeExceeded(object):
         return msg
 
     def serialize(self):
-        unused = 0
-        hdr = bytearray(struct.pack(TimeExceeded._PACK_STR,
-                        unused, self.data_len, unused))
+        hdr = bytearray(struct.pack(TimeExceeded._PACK_STR, self.data_len))
 
         if self.data is not None:
             hdr += self.data
