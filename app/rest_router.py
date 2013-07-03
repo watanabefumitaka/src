@@ -47,14 +47,6 @@ from ryu.ofproto import ofproto_v1_0
 from ryu.ofproto import ofproto_v1_2
 
 
-LOG = logging.getLogger(__name__)
-LOG.propagate = False
-hdlr = logging.StreamHandler()
-fmt = logging.Formatter('[RT][%(levelname)s] switch_id=%(sw_id)s: %(message)s')
-hdlr.setFormatter(fmt)
-LOG.addHandler(hdlr)
-
-
 #=============================
 #          REST API
 #=============================
@@ -184,10 +176,13 @@ class RestRouterAPI(app_manager.RyuApp):
 
     def __init__(self, *args, **kwargs):
         super(RestRouterAPI, self).__init__(*args, **kwargs)
+
+        # logger configure
+        RouterController.set_logger(self.logger)
+
         wsgi = kwargs['wsgi']
         self.waiters = {}
-        self.data = {}
-        self.data['waiters'] = self.waiters
+        self.data = {'waiters': self.waiters}
 
         mapper = wsgi.mapper
         wsgi.registory['RouterController'] = self.data
@@ -234,7 +229,7 @@ class RestRouterAPI(app_manager.RyuApp):
     def packet_in_handler(self, ev):
         RouterController.packet_in_handler(ev.msg)
 
-    def stats_reply_handler(self, ev):
+    def _stats_reply_handler(self, ev):
         msg = ev.msg
         dp = msg.datapath
 
@@ -252,12 +247,12 @@ class RestRouterAPI(app_manager.RyuApp):
     # for OpenFlow version1.0
     @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
     def stats_reply_handler_v1_0(self, ev):
-        self.stats_reply_handler(ev)
+        self._stats_reply_handler(ev)
 
     # for OpenFlow version1.2
     @set_ev_cls(ofp_event.EventOFPStatsReply, MAIN_DISPATCHER)
     def stats_reply_handler_v1_2(self, ev):
-        self.stats_reply_handler(ev)
+        self._stats_reply_handler(ev)
 
     #TODO: Update routing table when port status is changed.
 
@@ -270,7 +265,8 @@ def rest_command(func):
             return Response(content_type='application/json',
                             body=json.dumps(msg))
 
-        except (SyntaxError, ValueError, NameError) as e:
+        except (SyntaxError, ValueError, NameError,
+                struct.error, socket.error) as e:
             status = 400
             details = e.message
 
@@ -288,29 +284,93 @@ def rest_command(func):
 class RouterController(ControllerBase):
 
     _ROUTER_LIST = {}
+    _LOGGER = None
 
     def __init__(self, req, link, data, **config):
         super(RouterController, self).__init__(req, link, data, **config)
         self.waiters = data['waiters']
 
-    @staticmethod
-    def register_router(dp):
+    @classmethod
+    def set_logger(cls, logger):
+        cls._LOGGER = logger
+        cls._LOGGER.propagate = False
+        hdlr = logging.StreamHandler()
+        fmt_str = '[RT][%(levelname)s] switch_id=%(sw_id)s: %(message)s'
+        hdlr.setFormatter(logging.Formatter(fmt_str))
+        cls._LOGGER.addHandler(hdlr)
+
+    @classmethod
+    def register_router(cls, dp):
         dpid = {'sw_id': dpid_lib.dpid_to_str(dp.id)}
         try:
-            router = Router(dp)
+            router = Router(dp, cls._LOGGER)
         except OFPUnknownVersion as message:
-            LOG.error(str(message), extra=dpid)
+            cls._LOGGER.error(str(message), extra=dpid)
             return
-        RouterController._ROUTER_LIST.setdefault(dp.id, router)
-        LOG.info('Join as router.', extra=dpid)
+        cls._ROUTER_LIST.setdefault(dp.id, router)
+        cls._LOGGER.info('Join as router.', extra=dpid)
 
-    @staticmethod
-    def unregister_router(dp):
-        if dp.id in RouterController._ROUTER_LIST:
-            RouterController._ROUTER_LIST[dp.id].delete()
-            del RouterController._ROUTER_LIST[dp.id]
-            LOG.info('Leave router.',
-                     extra={'sw_id': dpid_lib.dpid_to_str(dp.id)})
+    @classmethod
+    def unregister_router(cls, dp):
+        if dp.id in cls._ROUTER_LIST:
+            cls._ROUTER_LIST[dp.id].delete()
+            del cls._ROUTER_LIST[dp.id]
+
+            dpid = {'sw_id': dpid_lib.dpid_to_str(dp.id)}
+            cls._LOGGER.info('Leave router.', extra=dpid)
+
+    @classmethod
+    def packet_in_handler(cls, msg):
+        dp_id = msg.datapath.id
+        if dp_id in cls._ROUTER_LIST:
+            router = cls._ROUTER_LIST[dp_id]
+            router.event_handler(msg)
+
+    # GET /router/{switch_id}
+    @rest_command
+    def get_data(self, req, switch_id, **_kwargs):
+        return self._access_router(switch_id, VLANID_NONE,
+                                   'get_data', req.body)
+
+    # GET /router/{switch_id}/{vlan_id}
+    @rest_command
+    def get_vlan_data(self, req, switch_id, vlan_id, **_kwargs):
+        return self._access_router(switch_id, vlan_id,
+                                   'get_data', req.body)
+
+    # POST /router/{switch_id}
+    @rest_command
+    def set_data(self, req, switch_id, **_kwargs):
+        return self._access_router(switch_id, VLANID_NONE,
+                                   'set_data', req.body)
+
+    # POST /router/{switch_id}/{vlan_id}
+    @rest_command
+    def set_vlan_data(self, req, switch_id, vlan_id, **_kwargs):
+        return self._access_router(switch_id, vlan_id,
+                                   'set_data', req.body)
+
+    # DELETE /router/{switch_id}
+    @rest_command
+    def delete_data(self, req, switch_id, **_kwargs):
+        return self._access_router(switch_id, VLANID_NONE,
+                                   'delete_data', req.body)
+
+    # DELETE /router/{switch_id}/{vlan_id}
+    @rest_command
+    def delete_vlan_data(self, req, switch_id, vlan_id, **_kwargs):
+        return self._access_router(switch_id, vlan_id,
+                                   'delete_data', req.body)
+
+    def _access_router(self, switch_id, vlan_id, func, param):
+        rest_message = []
+        routers = self._get_router(switch_id)
+        for router in routers.values():
+            function = getattr(router, func)
+            data = function(vlan_id, param, self.waiters)
+            rest_message.append(data)
+
+        return rest_message
 
     def _get_router(self, switch_id):
         routers = {}
@@ -327,72 +387,18 @@ class RouterController(ControllerBase):
         else:
             raise NotFoundError(switch_id=switch_id)
 
-    @staticmethod
-    def packet_in_handler(msg):
-        dp_id = msg.datapath.id
-        if dp_id in RouterController._ROUTER_LIST:
-            router = RouterController._ROUTER_LIST[dp_id]
-            router.event_handler(msg)
-
-    # GET /router/{switch_id}
-    @rest_command
-    def get_data(self, dummy, switch_id, **_kwargs):
-        return self._access_router(switch_id, VLANID_NONE, 'get_data')
-
-    # GET /router/{switch_id}/{vlan_id}
-    @rest_command
-    def get_vlan_data(self, dummy, switch_id, vlan_id, **_kwargs):
-        return self._access_router(switch_id, vlan_id, 'get_data')
-
-    # POST /router/{switch_id}
-    @rest_command
-    def set_data(self, req, switch_id, **_kwargs):
-        set_data = eval(req.body)
-        return self._access_router(switch_id, VLANID_NONE,
-                                   'set_data', param=set_data)
-
-    # POST /router/{switch_id}/{vlan_id}
-    @rest_command
-    def set_vlan_data(self, req, switch_id, vlan_id, **_kwargs):
-        set_data = eval(req.body)
-        return self._access_router(switch_id, vlan_id,
-                                   'set_data', param=set_data)
-
-    # DELETE /router/{switch_id}
-    @rest_command
-    def delete_data(self, req, switch_id, **_kwargs):
-        delete_data = eval(req.body)
-        return self._access_router(switch_id, VLANID_NONE,
-                                   'delete_data', param=delete_data)
-
-    # DELETE /router/{switch_id}/{vlan_id}
-    @rest_command
-    def delete_vlan_data(self, req, switch_id, vlan_id, **_kwargs):
-        delete_data = eval(req.body)
-        return self._access_router(switch_id, vlan_id,
-                                   'delete_data', param=delete_data)
-
-    def _access_router(self, switch_id, vlan_id, func, param=None):
-        rest_message = []
-        routers = self._get_router(switch_id)
-        for router in routers.values():
-            function = getattr(router, func)
-            data = function(vlan_id, param, self.waiters)
-            rest_message.append(data)
-
-        return rest_message
-
 
 class Router(dict):
-    def __init__(self, dp):
+    def __init__(self, dp, logger):
         super(Router, self).__init__()
         self.dp = dp
         self.dpid_str = dpid_lib.dpid_to_str(dp.id)
         self.sw_id = {'sw_id': self.dpid_str}
+        self.logger = logger
 
         self.port_data = PortData(dp.ports)
 
-        ofctl = OfCtl.factory(dp)
+        ofctl = OfCtl.factory(dp, logger)
         cookie = 0
 
         # Set SW config: TTL error packet in (only OFPv1.2)
@@ -401,25 +407,28 @@ class Router(dict):
         # Set flow: ARP handling (packet in)
         ofctl.set_packetin_flow(cookie, PRIORITY_ARP_HANDLING,
                                 dl_type=ether.ETH_TYPE_ARP)
-        LOG.info('Set ARP handling (packet in) flow [cookie=0x%x]', cookie,
-                 extra=self.sw_id)
+        self.logger.info('Set ARP handling (packet in) flow [cookie=0x%x]',
+                         cookie, extra=self.sw_id)
 
         # Set flow: L2 switching (normal)
         ofctl.set_normal_flow(cookie, PRIORITY_NORMAL)
-        LOG.info('Set L2 switching (normal) flow [cookie=0x%x]', cookie,
-                 extra=self.sw_id)
+        self.logger.info('Set L2 switching (normal) flow [cookie=0x%x]',
+                         cookie, extra=self.sw_id)
 
         # Set VlanRouter for vid=None.
-        vlan_router = VlanRouter(VLANID_NONE, dp, self.port_data)
-        self.setdefault(VLANID_NONE, vlan_router)
+        vlan_router = VlanRouter(VLANID_NONE, dp, self.port_data, logger)
+        self[VLANID_NONE] = vlan_router
 
         # Start cyclic routing table check.
         self.thread = hub.spawn(self._cyclic_update_routing_tbl)
-        LOG.info('Start cyclic routing table update.', extra=self.sw_id)
+        self.logger.info('Start cyclic routing table update.',
+                         extra=self.sw_id)
 
     def delete(self):
         hub.kill(self.thread)
-        LOG.info('Stop cyclic routing table update.', extra=self.sw_id)
+        self.thread.wait()
+        self.logger.info('Stop cyclic routing table update.',
+                         extra=self.sw_id)
 
     def _get_vlan_router(self, vlan_id):
         vlan_routers = []
@@ -441,8 +450,9 @@ class Router(dict):
     def _add_vlan_router(self, vlan_id):
         vlan_id = int(vlan_id)
         if vlan_id not in self:
-            vlan_router = VlanRouter(vlan_id, self.dp, self.port_data)
-            self.setdefault(vlan_id, vlan_router)
+            vlan_router = VlanRouter(vlan_id, self.dp, self.port_data,
+                                     self.logger)
+            self[vlan_id] = vlan_router
         return self[vlan_id]
 
     def _del_vlan_router(self, vlan_id, waiters):
@@ -460,25 +470,23 @@ class Router(dict):
         msgs = []
         vlan_routers = self._get_vlan_router(vlan_id)
         if vlan_routers:
-            for vlan_router in vlan_routers:
-                msg = vlan_router.get_data()
-                if msg:
-                    msgs.append(msg)
+            msgs = [vlan_router.get_data() for vlan_router in vlan_routers]
         else:
             msgs = [{REST_VLANID: vlan_id}]
 
         return {REST_SWITCHID: self.dpid_str,
                 REST_NW: msgs}
 
-    def set_data(self, vlan_id, data, waiters):
+    def set_data(self, vlan_id, rest_param, waiters):
         vlan_routers = self._get_vlan_router(vlan_id)
         if not vlan_routers:
             vlan_routers = [self._add_vlan_router(vlan_id)]
 
+        param = eval(rest_param)
         msgs = []
         for vlan_router in vlan_routers:
             try:
-                msg = vlan_router.set_data(data)
+                msg = vlan_router.set_data(param)
                 msgs.append(msg)
                 if msg[REST_RESULT] == REST_NG:
                     # Data setting is failure.
@@ -491,12 +499,13 @@ class Router(dict):
         return {REST_SWITCHID: self.dpid_str,
                 REST_COMMAND_RESULT: msgs}
 
-    def delete_data(self, vlan_id, data, waiters):
+    def delete_data(self, vlan_id, rest_param, waiters):
         msgs = []
         vlan_routers = self._get_vlan_router(vlan_id)
         if vlan_routers:
+            param = eval(rest_param)
             for vlan_router in vlan_routers:
-                msg = vlan_router.delete_data(data, waiters)
+                msg = vlan_router.delete_data(param, waiters)
                 if msg:
                     msgs.append(msg)
                 # Check unnecessary VlanRouter.
@@ -511,7 +520,7 @@ class Router(dict):
     def event_handler(self, msg):
         pkt = packet.Packet(msg.data)
         #TODO: Packet library convert to string
-        #LOG.debug('Packet in = %s', str(pkt), self.sw_id)
+        #self.logger.debug('Packet in = %s', str(pkt), self.sw_id)
         header_list = dict((p.protocol_name, p)
                            for p in pkt.protocols if type(p) != str)
         if header_list:
@@ -524,8 +533,8 @@ class Router(dict):
             if vlan_id in self:
                 self[vlan_id].event_handler(msg, header_list)
             else:
-                LOG.debug('Drop unknown vlan packet. [vlan_id=%d]', vlan_id,
-                          extra=self.sw_id)
+                self.logger.debug('Drop unknown vlan packet. [vlan_id=%d]',
+                                  vlan_id, extra=self.sw_id)
 
     def _cyclic_update_routing_tbl(self):
         while True:
@@ -538,17 +547,18 @@ class Router(dict):
 
 
 class VlanRouter(object):
-    def __init__(self, vlan_id, dp, port_data):
+    def __init__(self, vlan_id, dp, port_data, logger):
         super(VlanRouter, self).__init__()
         self.vlan_id = vlan_id
         self.dp = dp
         self.sw_id = {'sw_id': dpid_lib.dpid_to_str(dp.id)}
+        self.logger = logger
 
         self.port_data = port_data
         self.address_data = AddressData()
         self.routing_tbl = RoutingTable()
         self.packet_buffer = SuspendPacketList(self.send_icmp_unreach_error)
-        self.ofctl = OfCtl.factory(dp)
+        self.ofctl = OfCtl.factory(dp, logger)
 
         # Set flow: default route (drop)
         self._set_defaultroute_drop()
@@ -565,7 +575,6 @@ class VlanRouter(object):
 
     @staticmethod
     def _cookie_to_id(id_type, cookie):
-
         if id_type == REST_VLANID:
             rest_id = cookie >> COOKIE_SHIFT_VLANID
         elif id_type == REST_ADDRESSID:
@@ -668,8 +677,8 @@ class VlanRouter(object):
                                      dl_vlan=self.vlan_id,
                                      dst_ip=address.nw_addr,
                                      dst_mask=address.netmask)
-        LOG.info('Set host MAC learning (packet in) flow [cookie=0x%x]',
-                 cookie, extra=self.sw_id)
+        log_msg = 'Set host MAC learning (packet in) flow [cookie=0x%x]'
+        self.logger.info(log_msg, cookie, extra=self.sw_id)
 
         # set Flow: IP handling(PacketIn)
         self.ofctl.set_packetin_flow(cookie,
@@ -677,8 +686,8 @@ class VlanRouter(object):
                                      dl_type=ether.ETH_TYPE_IP,
                                      dl_vlan=self.vlan_id,
                                      dst_ip=address.default_gw)
-        LOG.info('Set IP handling (packet in) flow [cookie=0x%x]', cookie,
-                 extra=self.sw_id)
+        self.logger.info('Set IP handling (packet in) flow [cookie=0x%x]',
+                         cookie, extra=self.sw_id)
 
         # Set flow: L2 switching (normal)
         outport = self.ofctl.dp.ofproto.OFPP_NORMAL
@@ -686,8 +695,8 @@ class VlanRouter(object):
             cookie, PRIORITY_L2_SWITCHING, outport, dl_vlan=self.vlan_id,
             nw_src=address.nw_addr, src_mask=address.netmask,
             nw_dst=address.nw_addr, dst_mask=address.netmask)
-        LOG.info('Set L2 switching (normal) flow [cookie=0x%x]', cookie,
-                 extra=self.sw_id)
+        self.logger.info('Set L2 switching (normal) flow [cookie=0x%x]',
+                         cookie, extra=self.sw_id)
 
         # Send GARP
         self.send_arp_request(address.default_gw, address.default_gw)
@@ -697,8 +706,8 @@ class VlanRouter(object):
     def _set_routing_data(self, destination, gateway):
         try:
             dst_ip = ip_addr_aton(gateway)
-        except ValueError:
-            msg = 'Invalid [%s] value.' % REST_GATEWAY
+        except (struct.error, socket.error) as e:
+            msg = 'Invalid [%s] value. %s' % (REST_GATEWAY, e.message)
             raise ValueError(msg)
         address = self.address_data.get_data(dst_ip)
         if address is None:
@@ -720,8 +729,8 @@ class VlanRouter(object):
         outport = None  # for drop
         self.ofctl.set_routing_flow(cookie, PRIORITY_DEFAULT_ROUTING,
                                     outport, dl_vlan=self.vlan_id)
-        LOG.info('Set default route (drop) flow [cookie=0x%x]', cookie,
-                 extra=self.sw_id)
+        self.logger.info('Set default route (drop) flow [cookie=0x%x]',
+                         cookie, extra=self.sw_id)
 
     def _set_route_packetin(self, route):
         cookie = self._id_to_cookie(REST_ROUTEID, route.route_id)
@@ -736,8 +745,8 @@ class VlanRouter(object):
                                      dl_vlan=self.vlan_id,
                                      dst_ip=route.dst_ip,
                                      dst_mask=route.netmask)
-        LOG.info('Set %s (packet in) flow [cookie=0x%x]', log_msg, cookie,
-                 extra=self.sw_id)
+        self.logger.info('Set %s (packet in) flow [cookie=0x%x]', log_msg,
+                         cookie, extra=self.sw_id)
 
     def delete_data(self, data, waiters):
         if REST_ROUTEID in data:
@@ -943,8 +952,9 @@ class VlanRouter(object):
             output = self.ofctl.dp.ofproto.OFPP_NORMAL
             self.ofctl.send_packet_out(in_port, output, msg.data)
 
-            LOG.info('Receive GARP from [%s].', srcip, extra=self.sw_id)
-            LOG.info('Send GARP (normal).', extra=self.sw_id)
+            self.logger.info('Receive GARP from [%s].', srcip,
+                             extra=self.sw_id)
+            self.logger.info('Send GARP (normal).', extra=self.sw_id)
 
         elif dst_ip not in rt_ports:
             dst_addr = self.address_data.get_data(dst_ip)
@@ -954,15 +964,14 @@ class VlanRouter(object):
                 output = self.ofctl.dp.ofproto.OFPP_NORMAL
                 self.ofctl.send_packet_out(in_port, output, msg.data)
 
-                LOG.info('Receive ARP from an internal host [%s].', srcip,
-                         extra=self.sw_id)
-                LOG.info('Send ARP (normal)', extra=self.sw_id)
+                self.logger.info('Receive ARP from an internal host [%s].',
+                                 srcip, extra=self.sw_id)
+                self.logger.info('Send ARP (normal)', extra=self.sw_id)
         else:
             if header_list[ARP].opcode == arp.ARP_REQUEST:
                 # ARP request to router port -> send ARP reply
-                port_data = self.port_data.get_data(port_no=in_port)
                 src_mac = header_list[ARP].src_mac
-                dst_mac = port_data.mac
+                dst_mac = self.port_data[in_port].mac
                 arp_target_mac = dst_mac
                 output = self.ofctl.dp.ofproto.OFPP_IN_PORT
 
@@ -970,14 +979,15 @@ class VlanRouter(object):
                                     dst_mac, src_mac, dst_ip, src_ip,
                                     arp_target_mac, in_port, output)
 
-                LOG.info('Receive ARP request from [%s] to router port [%s].',
-                         srcip, dstip, extra=self.sw_id)
-                LOG.info('Send ARP reply to [%s]', srcip, extra=self.sw_id)
+                log_msg = 'Receive ARP request from [%s] to router port [%s].'
+                self.logger.info(log_msg, srcip, dstip, extra=self.sw_id)
+                self.logger.info('Send ARP reply to [%s]', srcip,
+                                 extra=self.sw_id)
 
             elif header_list[ARP].opcode == arp.ARP_REPLY:
                 #  ARP reply to router port -> suspend packets forward
-                LOG.info('Receive ARP reply from [%s] to router port [%s].',
-                         srcip, dstip, extra=self.sw_id)
+                log_msg = 'Receive ARP reply from [%s] to router port [%s].'
+                self.logger.info(log_msg, srcip, dstip, extra=self.sw_id)
 
                 if src_ip in self.packet_buffer:
                     packet_list = self.packet_buffer[src_ip]
@@ -986,8 +996,8 @@ class VlanRouter(object):
                         self.ofctl.send_packet_out(suspend_packet.in_port,
                                                    output,
                                                    suspend_packet.data)
-                        LOG.info('Send suspend packet to [%s].', srcip,
-                                 extra=self.sw_id)
+                        self.logger.info('Send suspend packet to [%s].',
+                                         srcip, extra=self.sw_id)
                     del self.packet_buffer[src_ip]
                     self.packet_buffer.length -= len(packet_list)
 
@@ -1001,9 +1011,10 @@ class VlanRouter(object):
 
         srcip = ip_addr_ntoa(header_list[IPV4].src)
         dstip = ip_addr_ntoa(header_list[IPV4].dst)
-        LOG.info('Receive ICMP echo request from [%s] to router port [%s].',
-                 srcip, dstip, extra=self.sw_id)
-        LOG.info('Send ICMP echo reply to [%s].', srcip, extra=self.sw_id)
+        log_msg = 'Receive ICMP echo request from [%s] to router port [%s].'
+        self.logger.info(log_msg, srcip, dstip, extra=self.sw_id)
+        self.logger.info('Send ICMP echo reply to [%s].', srcip,
+                         extra=self.sw_id)
 
     def _event_tcp_udp(self, msg, header_list):
         # Send ICMP port unreach error.
@@ -1015,15 +1026,15 @@ class VlanRouter(object):
 
         srcip = ip_addr_ntoa(header_list[IPV4].src)
         dstip = ip_addr_ntoa(header_list[IPV4].dst)
-        LOG.info('Receive TCP/UDP from [%s] to router port [%s].',
-                 srcip, dstip, extra=self.sw_id)
-        LOG.info('Send ICMP destination unreachable to [%s].', srcip,
-                 extra=self.sw_id)
+        self.logger.info('Receive TCP/UDP from [%s] to router port [%s].',
+                         srcip, dstip, extra=self.sw_id)
+        self.logger.info('Send ICMP destination unreachable to [%s].', srcip,
+                         extra=self.sw_id)
 
     def _event_packetin_node(self, msg, header_list):
         if self.packet_buffer.length >= MAX_SUSPENDPACKETS:
-            LOG.info('Packet is dropped, MAX_SUSPENDPACKETS exceeded.',
-                     extra=self.sw_id)
+            self.logger.info('Packet is dropped, MAX_SUSPENDPACKETS exceeded.',
+                             extra=self.sw_id)
             return
 
         # Send ARP request to get node MAC address.
@@ -1035,14 +1046,14 @@ class VlanRouter(object):
 
         address = self.address_data.get_data(dst_ip)
         if address is not None:
-            LOG.info('Receive IP packet from [%s] to an internal host [%s].',
-                     srcip, dstip, extra=self.sw_id)
+            log_msg = 'Receive IP packet from [%s] to an internal host [%s].'
+            self.logger.info(log_msg, srcip, dstip, extra=self.sw_id)
             src_ip = address.default_gw
         else:
             route = self.routing_tbl.get_data(dst_ip=dst_ip)
             if route is not None:
-                LOG.info('Receive IP packet from [%s] to gateway router [%s].',
-                         srcip, dstip, extra=self.sw_id)
+                log_msg = 'Receive IP packet from [%s] to gateway router [%s].'
+                self.logger.info(log_msg, srcip, dstip, extra=self.sw_id)
                 gw_address = self.address_data.get_data(route.gateway_ip)
                 if gw_address is not None:
                     src_ip = gw_address.default_gw
@@ -1051,13 +1062,13 @@ class VlanRouter(object):
         if src_ip is not None:
             self.packet_buffer.add(in_port, dst_ip, header_list, msg.data)
             self.send_arp_request(src_ip, dst_ip, in_port=in_port)
-            LOG.info('Send ARP request (flood)', extra=self.sw_id)
+            self.logger.info('Send ARP request (flood)', extra=self.sw_id)
 
     def _event_invalid_ttl(self, msg, header_list):
         # Send ICMP TTL error.
         srcip = ip_addr_ntoa(header_list[IPV4].src)
-        LOG.info('Receive invalid ttl packet from [%s].', srcip,
-                 extra=self.sw_id)
+        self.logger.info('Receive invalid ttl packet from [%s].', srcip,
+                         extra=self.sw_id)
 
         in_port = self.ofctl.get_packetin_inport(msg)
         src_ip = self._get_send_port_ip(header_list)
@@ -1066,8 +1077,8 @@ class VlanRouter(object):
                                  icmp.ICMP_TIME_EXCEEDED,
                                  icmp.ICMP_TTL_EXPIRED_CODE,
                                  msg_data=msg.data, src_ip=src_ip)
-            LOG.info('Send ICMP time exceeded to [%s].', srcip,
-                     extra=self.sw_id)
+            self.logger.info('Send ICMP time exceeded to [%s].', srcip,
+                             extra=self.sw_id)
 
     def send_arp_all_gw(self):
         gateways = self.routing_tbl.get_gateways()
@@ -1090,7 +1101,8 @@ class VlanRouter(object):
 
     def send_icmp_unreach_error(self, packet_buffer_list):
         # Send ICMP host unreach error.
-        LOG.info('ARP reply wait timer was timed out.', extra=self.sw_id)
+        self.logger.info('ARP reply wait timer was timed out.',
+                         extra=self.sw_id)
         for packet_buffer in packet_buffer_list:
             src_ip = self._get_send_port_ip(packet_buffer.header_list)
             if src_ip is not None:
@@ -1103,15 +1115,14 @@ class VlanRouter(object):
                                      src_ip=src_ip)
 
                 dstip = ip_addr_ntoa(packet_buffer.header_list[IPV4].src)
-                LOG.info('Send ICMP destination unreachable to [%s].', dstip,
-                         extra=self.sw_id)
+                self.logger.info('Send ICMP destination unreachable to [%s].',
+                                 dstip, extra=self.sw_id)
 
     def _update_routing_tbl(self, msg, header_list):
         # Set flow: routing to gateway.
         out_port = self.ofctl.get_packetin_inport(msg)
-        port_data = self.port_data.get_data(port_no=out_port)
         src_mac = header_list[ARP].src_mac
-        dst_mac = port_data.mac
+        dst_mac = self.port_data[out_port].mac
         src_ip = header_list[ARP].src_ip
 
         gateway_flg = False
@@ -1136,16 +1147,15 @@ class VlanRouter(object):
                                             nw_dst=value.dst_ip,
                                             dst_mask=value.netmask,
                                             dec_ttl=True)
-                LOG.info('Set %s flow [cookie=0x%x]', log_msg, cookie,
-                         extra=self.sw_id)
+                self.logger.info('Set %s flow [cookie=0x%x]', log_msg, cookie,
+                                 extra=self.sw_id)
         return gateway_flg
 
     def _learning_host_mac(self, msg, header_list):
         # Set flow: routing to internal Host.
         out_port = self.ofctl.get_packetin_inport(msg)
-        port_data = self.port_data.get_data(port_no=out_port)
         src_mac = header_list[ARP].src_mac
-        dst_mac = port_data.mac
+        dst_mac = self.port_data[out_port].mac
         src_ip = header_list[ARP].src_ip
 
         gateways = self.routing_tbl.get_gateways()
@@ -1159,8 +1169,8 @@ class VlanRouter(object):
                                             nw_dst=src_ip,
                                             idle_timeout=IDLE_TIMEOUT,
                                             dec_ttl=True)
-                LOG.info('Set implicit routing flow [cookie=0x%x]', cookie,
-                         extra=self.sw_id)
+                self.logger.info('Set implicit routing flow [cookie=0x%x]',
+                                 cookie, extra=self.sw_id)
 
     def _get_send_port_ip(self, header_list):
         try:
@@ -1170,7 +1180,7 @@ class VlanRouter(object):
             else:
                 src_ip = header_list[ARP].src_ip
         except KeyError:
-            LOG.debug('Receive unsupported packet.', extra=self.sw_id)
+            self.logger.debug('Receive unsupported packet.', extra=self.sw_id)
             return None
 
         address = self.address_data.get_data(src_ip)
@@ -1183,8 +1193,8 @@ class VlanRouter(object):
                 if address is not None:
                     return address.default_gw
 
-        LOG.debug('Receive packet from unknown IP[%s].', ip_addr_ntoa(src_ip),
-                  extra=self.sw_id)
+        self.logger.debug('Receive packet from unknown IP[%s].',
+                          ip_addr_ntoa(src_ip), extra=self.sw_id)
         return None
 
 
@@ -1193,16 +1203,7 @@ class PortData(dict):
         super(PortData, self).__init__()
         for port in ports.values():
             data = Port(port.port_no, port.hw_addr)
-            self.setdefault(port.port_no, data)
-
-    def get_data(self, port_no=None, mac=None, ip=None):
-        if port_no is not None:
-            return self.get(port_no, None)
-        for port in self.values():
-            if ((mac is not None and mac == port.mac)
-                    or (ip is not None and ip == port.ip)):
-                return port
-        return None
+            self[port.port_no] = data
 
 
 class Port(object):
@@ -1220,11 +1221,12 @@ class AddressData(dict):
     def add(self, address):
         try:
             nw_addr, mask, default_gw = nw_addr_aton(address)
-        except ValueError:
-            raise ValueError('Invalid [%s] value.' % REST_ADDRESS)
+        except (ValueError, struct.error, socket.error) as e:
+            raise ValueError('Invalid [%s] value. %s' % (REST_ADDRESS,
+                                                         e.message))
 
         # Check overlaps
-        overlap_address = 0
+        overlap_address = None
         for other in self.values():
             other_mask = mask_ntob(other.netmask)
             add_mask = mask_ntob(mask)
@@ -1232,7 +1234,7 @@ class AddressData(dict):
                     or nw_addr == other.default_gw & add_mask):
                 overlap_address = other.address_id
                 break
-        if overlap_address:
+        if overlap_address is not None:
             msg = 'Address overlaps [address_id=%d]' % overlap_address
             raise CommandFailure(msg=msg)
 
@@ -1251,10 +1253,7 @@ class AddressData(dict):
                 del self[key]
 
     def get_default_gw(self):
-        default_gw = []
-        for address in self.values():
-            default_gw.append(address.default_gw)
-        return default_gw
+        return [address.default_gw for address in self.values()]
 
     def get_data(self, ip):
         for address in self.values():
@@ -1284,22 +1283,24 @@ class RoutingTable(dict):
         else:
             try:
                 dst_ip, netmask, dummy = nw_addr_aton(dst_nw_addr)
-            except ValueError:
-                raise ValueError('Invalid [%s] value.' % REST_DESTINATION)
+            except (ValueError, struct.error, socket.error) as e:
+                raise ValueError('Invalid [%s] value. %s' % (REST_DESTINATION,
+                                                             e.message))
         try:
             gateway_ip = ip_addr_aton(gateway_ip)
-        except ValueError:
-            raise ValueError('Invalid [%s] value.' % REST_GATEWAY)
+        except (struct.error, socket.error) as e:
+            raise ValueError('Invalid [%s] value. %s' % (REST_GATEWAY,
+                                                         e.message))
 
         # Check overlaps
-        overlap_route = 0
+        overlap_route = None
         if dst_nw_addr == DEFAULT_ROUTE:
             if DEFAULT_ROUTE in self:
                 overlap_route = self[DEFAULT_ROUTE].route_id
         elif dst_nw_addr in self:
             overlap_route = self[dst_nw_addr].route_id
 
-        if overlap_route:
+        if overlap_route is not None:
             msg = 'Destination overlaps [route_id=%d]' % overlap_route
             raise CommandFailure(msg=msg)
 
@@ -1308,6 +1309,7 @@ class RoutingTable(dict):
         key = '%s/%d' % (ip_str, netmask)
         self[key] = routing_data
         self.route_id += 1
+        self.route_id &= UINT32_MAX
 
         return routing_data
 
@@ -1318,11 +1320,7 @@ class RoutingTable(dict):
                 return
 
     def get_gateways(self):
-        gateways = []
-        for routing_data in self.values():
-            if routing_data.gateway_ip not in gateways:
-                gateways.append(routing_data.gateway_ip)
-        return gateways
+        return [routing_data.gateway_ip for routing_data in self.values()]
 
     def get_data(self, gw_mac=None, dst_ip=None):
         if gw_mac is not None:
@@ -1351,7 +1349,7 @@ class RoutingTable(dict):
 class Route(object):
     def __init__(self, route_id, dst_ip, netmask, gateway_ip):
         super(Route, self).__init__()
-        self.route_id = route_id & UINT32_MAX
+        self.route_id = route_id
         self.dst_ip = dst_ip
         self.netmask = netmask
         self.gateway_ip = gateway_ip
@@ -1400,19 +1398,20 @@ class OfCtl(object):
         return _register_of_version
 
     @staticmethod
-    def factory(dp):
+    def factory(dp, logger):
         of_version = dp.ofproto.OFP_VERSION
         if of_version in OfCtl._OF_VERSIONS:
-            ofctl = OfCtl._OF_VERSIONS[of_version](dp)
+            ofctl = OfCtl._OF_VERSIONS[of_version](dp, logger)
         else:
             raise OFPUnknownVersion(version=of_version)
 
         return ofctl
 
-    def __init__(self, dp):
+    def __init__(self, dp, logger):
         super(OfCtl, self).__init__()
         self.dp = dp
         self.sw_id = {'sw_id': dpid_lib.dpid_to_str(dp.id)}
+        self.logger = logger
 
     def set_sw_config_for_ttl(self):
         # OpenFlow v1_2 only.
@@ -1422,7 +1421,7 @@ class OfCtl(object):
                  nw_src=0, src_mask=32, nw_dst=0, dst_mask=32,
                  nw_proto=0, idle_timeout=0, actions=None):
         # Abstract method
-        pass
+        raise NotImplementedError()
 
     def send_arp(self, arp_opcode, vlan_id, src_mac, dst_mac,
                  src_ip, dst_ip, arp_target_mac, in_port, output):
@@ -1513,11 +1512,9 @@ class OfCtl(object):
         self.dp.send_packet_out(buffer_id=UINT32_MAX, in_port=in_port,
                                 actions=actions, data=data)
         #TODO: Packet library convert to string
-        """
-        if data_str is None:
-            data_str = str(packet.Packet(data))
-        LOG.debug('Packet out = %s', data_str, extra=self.sw_id)
-        """
+        #if data_str is None:
+        #    data_str = str(packet.Packet(data))
+        #self.logger.debug('Packet out = %s', data_str, extra=self.sw_id)
 
     def set_normal_flow(self, cookie, priority):
         out_port = self.dp.ofproto.OFPP_NORMAL
@@ -1552,8 +1549,8 @@ class OfCtl(object):
 @OfCtl.register_of_version(ofproto_v1_0.OFP_VERSION)
 class OfCtl_v1_0(OfCtl):
 
-    def __init__(self, dp):
-        super(OfCtl_v1_0, self).__init__(dp)
+    def __init__(self, dp, logger):
+        super(OfCtl_v1_0, self).__init__(dp, logger)
 
     def get_packetin_inport(self, msg):
         return msg.in_port
@@ -1636,14 +1633,14 @@ class OfCtl_v1_0(OfCtl):
         flow_mod = self.dp.ofproto_parser.OFPFlowMod(
             self.dp, match, cookie, cmd, priority=priority, actions=actions)
         self.dp.send_msg(flow_mod)
-        LOG.info('Delete flow [cookie=0x%x]', cookie, extra=self.sw_id)
+        self.logger.info('Delete flow [cookie=0x%x]', cookie, extra=self.sw_id)
 
 
 @OfCtl.register_of_version(ofproto_v1_2.OFP_VERSION)
 class OfCtl_v1_2(OfCtl):
 
-    def __init__(self, dp):
-        super(OfCtl_v1_2, self).__init__(dp)
+    def __init__(self, dp, logger):
+        super(OfCtl_v1_2, self).__init__(dp, logger)
 
     def set_sw_config_for_ttl(self):
         flags = self.dp.ofproto.OFPC_INVALID_TTL_TO_CONTROLLER
@@ -1651,7 +1648,8 @@ class OfCtl_v1_2(OfCtl):
         m = self.dp.ofproto_parser.OFPSetConfig(self.dp, flags,
                                                 miss_send_len)
         self.dp.send_msg(m)
-        LOG.info('Set SW config for TTL error packet in.', extra=self.sw_id)
+        self.logger.info('Set SW config for TTL error packet in.',
+                         extra=self.sw_id)
 
     def get_packetin_inport(self, msg):
         in_port = self.dp.ofproto.OFPP_ANY
@@ -1747,21 +1745,15 @@ class OfCtl_v1_2(OfCtl):
                                          0, 0, 0, UINT32_MAX, ofp.OFPP_ANY,
                                          ofp.OFPG_ANY, 0, match, inst)
         self.dp.send_msg(flow_mod)
-        LOG.info('Delete flow [cookie=0x%x]', cookie, extra=self.sw_id)
+        self.logger.info('Delete flow [cookie=0x%x]', cookie, extra=self.sw_id)
 
 
 def ip_addr_aton(ip_str):
-    try:
-        return struct.unpack('!I', socket.inet_aton(ip_str))[0]
-    except (struct.error, socket.error):
-        raise ValueError()
+    return struct.unpack('!I', socket.inet_aton(ip_str))[0]
 
 
 def ip_addr_ntoa(ip):
-    try:
-        return socket.inet_ntoa(struct.pack('!I', ip))
-    except (struct.error, socket.error):
-        raise ValueError()
+    return socket.inet_ntoa(struct.pack('!I', ip))
 
 
 def mask_ntob(mask):
@@ -1775,6 +1767,6 @@ def nw_addr_aton(nw_addr):
     if len(ip_mask) == 2:
         netmask = int(ip_mask[1])
     if netmask < 0:
-        raise ValueError()
+        raise ValueError('illegal netmask')
     nw_addr = default_route & mask_ntob(netmask)
     return nw_addr, netmask, default_route
