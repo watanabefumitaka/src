@@ -835,7 +835,7 @@ class VlanRouter(object):
             del_address = self.address_data.get_data(addr_id=address_id)
             if del_address is not None:
                 # Clean up suspend packet threads.
-                self.packet_buffer.remove(del_addr=del_address)
+                self.packet_buffer.delete(del_addr=del_address)
 
                 # Delete data.
                 self.address_data.delete(address_id)
@@ -1020,7 +1020,7 @@ class VlanRouter(object):
                 if packet_list:
                     # stop ARP reply wait thread.
                     for suspend_packet in packet_list:
-                        self.packet_buffer.remove(pkt=suspend_packet)
+                        self.packet_buffer.delete(pkt=suspend_packet)
 
                     # send suspend packet.
                     output = self.ofctl.dp.ofproto.OFPP_TABLE
@@ -1273,6 +1273,7 @@ class AddressData(dict):
         for key, value in self.items():
             if value.address_id == address_id:
                 del self[key]
+                return
 
     def get_default_gw(self):
         return [address.default_gw for address in self.values()]
@@ -1298,10 +1299,7 @@ class Address(object):
         self.default_gw = default_gw
 
     def __contains__(self, ip):
-        if ip & mask_ntob(self.netmask) == self.nw_addr:
-            return True
-        else:
-            return False
+        return bool(ip & mask_ntob(self.netmask) == self.nw_addr)
 
 
 class RoutingTable(dict):
@@ -1398,7 +1396,7 @@ class SuspendPacketList(list):
                                     self.wait_arp_reply_timer)
         self.append(suspend_pkt)
 
-    def remove(self, pkt=None, del_addr=None):
+    def delete(self, pkt=None, del_addr=None):
         if pkt is not None:
             del_list = [pkt]
         else:
@@ -1406,8 +1404,9 @@ class SuspendPacketList(list):
             del_list = [pkt for pkt in self if pkt.dst_ip in del_addr]
 
         for pkt in del_list:
+            self.remove(pkt)
             hub.kill(pkt.wait_thread)
-            super(SuspendPacketList, self).remove(pkt)
+            pkt.wait_thread.wait()
 
     def get_data(self, dst_ip):
         return [pkt for pkt in self if pkt.dst_ip == dst_ip]
@@ -1416,7 +1415,7 @@ class SuspendPacketList(list):
         hub.sleep(ARP_REPLY_TIMER)
         if suspend_pkt in self:
             self.timeout_function(suspend_pkt)
-            self.remove(pkt=suspend_pkt)
+            self.delete(pkt=suspend_pkt)
 
 
 class SuspendPacket(object):
