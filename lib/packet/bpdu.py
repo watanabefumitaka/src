@@ -228,7 +228,7 @@ class ConfigurationBPDUs(bpdu):
 
     VERSION_ID = PROTOCOLVERSION_ID_BPDU
     BPDU_TYPE = TYPE_CONFIG_BPDU
-    _PACK_STR = '=BQIQHHHHH'
+    _PACK_STR = '!BQIQHHHHH'
     PACK_LEN = struct.calcsize(_PACK_STR)
 
     _BRIDGE_PRIORITY_STEP = 4096
@@ -274,10 +274,15 @@ class ConfigurationBPDUs(bpdu):
          forward_delay) = struct.unpack_from(ConfigurationBPDUs._PACK_STR, buf)
 
         #TODO:
+        print 'flags = ' + format(flags, 'x')
         print 'root_id = ' + format(root_id, 'x')
+        print 'root_path_cost = ' + format(root_path_cost, 'x')
         print 'bridge_id = ' + format(bridge_id, 'x')
         print 'port_id = ' + format(port_id, 'x')
-        print 'root_path_cost = ' + str(root_path_cost)
+        print 'message_age = ' + format(message_age, 'x')
+        print 'max_age = ' + format(max_age, 'x')
+        print 'hello_time = ' + format(hello_time, 'x')
+        print 'forward_delay = ' + format(forward_delay, 'x')
 
         (root_priority,
          root_system_id_extension,
@@ -292,7 +297,10 @@ class ConfigurationBPDUs(bpdu):
                     root_mac_address, root_path_cost,
                     bridge_priority, bridge_system_id_extension,
                     bridge_mac_address, port_priority, port_number,
-                    message_age, max_age, hello_time, forward_delay),
+                    cls._decode_timer(message_age),
+                    cls._decode_timer(max_age),
+                    cls._decode_timer(hello_time),
+                    cls._decode_timer(forward_delay)),
                 None, buf[ConfigurationBPDUs.PACK_LEN:])
 
     def serialize(self, payload, prev):
@@ -312,10 +320,10 @@ class ConfigurationBPDUs(bpdu):
                           self.root_path_cost,
                           bridge_id,
                           port_id,
-                          self.message_age,
-                          self.max_age,
-                          self.hello_time,
-                          self.forward_delay)
+                          self._encode_timer(self.message_age),
+                          self._encode_timer(self.max_age),
+                          self._encode_timer(self.hello_time),
+                          self._encode_timer(self.forward_delay))
 
         return base + sub
 
@@ -350,6 +358,14 @@ class ConfigurationBPDUs(bpdu):
     @staticmethod
     def encode_port_id(priority, port_number):
         return (priority >> 4) + (port_number << 4)
+
+    @staticmethod
+    def _decode_timer(timer):
+        return timer >> 8
+
+    @staticmethod
+    def _encode_timer(timer):
+        return timer << 8
 
 
 @bpdu.register_bpdu_type
