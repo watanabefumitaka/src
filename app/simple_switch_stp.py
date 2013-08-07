@@ -1,10 +1,10 @@
-# Copyright (C) 2013 Nippon Telegraph and Telephone Corporation.
+# Copyright (C) 2011 Nippon Telegraph and Telephone Corporation.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-# http://www.apache.org/licenses/LICENSE-2.0
+#    http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -12,7 +12,6 @@
 # implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 
 import logging
 import struct
@@ -25,6 +24,8 @@ from ryu.controller.handler import set_ev_cls
 from ryu.ofproto import ofproto_v1_0
 from ryu.lib.mac import haddr_to_str
 
+#TODO:
+#from ryu.app import stp
 import stp
 
 
@@ -43,7 +44,6 @@ class SimpleSwitchStp(app_manager.RyuApp):
     def __init__(self, *args, **kwargs):
         super(SimpleSwitchStp, self).__init__(*args, **kwargs)
         self.mac_to_port = {}
-        self.stp_ins = kwargs['stp']
 
     def add_flow(self, datapath, in_port, dst, actions):
         ofproto = datapath.ofproto
@@ -63,8 +63,20 @@ class SimpleSwitchStp(app_manager.RyuApp):
             flags=ofproto.OFPFF_SEND_FLOW_REM, actions=actions)
         datapath.send_msg(mod)
 
-    @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
-    def _packet_in_handler(self, ev):
+    def delete_flow(self, datapath):
+        ofproto = datapath.ofproto
+
+        wildcards = ofproto_v1_0.OFPFW_ALL
+        match = datapath.ofproto_parser.OFPMatch(
+            wildcards, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+
+        mod = datapath.ofproto_parser.OFPFlowMod(
+            datapath=datapath, match=match, cookie=0,
+            command=ofproto.OFPFC_DELETE)
+        datapath.send_msg(mod)
+
+    @set_ev_cls(stp.EventPacketIn, stp.STP_EV_DISPATCHER)
+    def packet_in_handler(self, ev):
         msg = ev.msg
         datapath = msg.datapath
         ofproto = datapath.ofproto
@@ -74,12 +86,9 @@ class SimpleSwitchStp(app_manager.RyuApp):
         dpid = datapath.id
         self.mac_to_port.setdefault(dpid, {})
 
-        #TODO:
-        """
-        self.logger.info("packet in %s %s %s %s",
-                         dpid, haddr_to_str(src), haddr_to_str(dst),
-                         msg.in_port)
-        """
+        #self.logger.info("packet in %s %s %s %s",
+        #                 dpid, haddr_to_str(src), haddr_to_str(dst),
+        #                 msg.in_port)
 
         # learn a mac address to avoid FLOOD next time.
         self.mac_to_port[dpid][src] = msg.in_port
@@ -105,8 +114,9 @@ class SimpleSwitchStp(app_manager.RyuApp):
         msg = ev.msg
         reason = msg.reason
         port_no = msg.desc.port_no
+        dp = msg.datapath
+        ofproto = dp.ofproto
 
-        ofproto = msg.datapath.ofproto
         if reason == ofproto.OFPPR_ADD:
             self.logger.info("port added %s", port_no)
         elif reason == ofproto.OFPPR_DELETE:
@@ -115,3 +125,12 @@ class SimpleSwitchStp(app_manager.RyuApp):
             self.logger.info("port modified %s", port_no)
         else:
             self.logger.info("Illeagal port state %s %s", port_no, reason)
+
+        # for STP(802.1D spanning tree)
+        stp_port_state = msg.desc.state & ofproto.OFPPS_STP_MASK
+
+        if (stp_port_state == ofproto.OFPPS_STP_BLOCK
+                or stp_port_state == ofproto.OFPPS_STP_LISTEN):
+            if dp.id in self.mac_to_port:
+                del self.mac_to_port[dp.id]
+            self.delete_flow(dp)
