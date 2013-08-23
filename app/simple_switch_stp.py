@@ -22,11 +22,12 @@ from ryu.controller import ofp_event
 from ryu.controller.handler import MAIN_DISPATCHER
 from ryu.controller.handler import set_ev_cls
 from ryu.ofproto import ofproto_v1_0
+from ryu.lib import dpid as dpid_lib
 from ryu.lib.mac import haddr_to_str
 
 #TODO:
-#from ryu.app import stp
-import stp
+#from ryu.lib import stp_lib
+import stp_lib
 
 
 # TODO: we should split the handler into two parts, protocol
@@ -37,13 +38,63 @@ import stp
 # TODO: we need to move the followings to something like db
 
 
+# Sample of stp_lib config
+#  - please refer to stp_lib.Stp.set_config() for details.
+STP_CONFIG = {dpid_lib.str_to_dpid('0000000000000001'):
+               {'bridge': {'priority': 0x8000,
+                           'max_age': 20,
+                           'hello_time': 2,
+                           'fwd_delay': 15},
+                'ports': {1: {'priority': 0x80,
+                              'path_cost': 20,
+                              'enable': True},
+                          2: {'priority': 0x80,
+                              'path_cost': 20,
+                              'enable': True},
+                          3: {'priority': 0x80,
+                              'path_cost': 20,
+                              'enable': True},}},
+
+              dpid_lib.str_to_dpid('0000000000000002'):
+               {'bridge': {'priority': 0x9000,
+                           'max_age': 20,
+                           'hello_time': 2,
+                           'fwd_delay': 15},
+                'ports': {1: {'priority': 0x80,
+                              'path_cost': 20,
+                              'enable': True},
+                          2: {'priority': 0x80,
+                              'path_cost': 20,
+                              'enable': True},
+                          3: {'priority': 0x80,
+                              'path_cost': 20,
+                              'enable': True},}},
+
+              dpid_lib.str_to_dpid('0000000000000003'):
+               {'bridge': {'priority': 0xa000,
+                           'max_age': 20,
+                           'hello_time': 2,
+                           'fwd_delay': 15},
+                'ports': {1: {'priority': 0x80,
+                              'path_cost': 20,
+                              'enable': True},
+                          2: {'priority': 0x80,
+                              'path_cost': 20,
+                              'enable': True},
+                          3: {'priority': 0x80,
+                              'path_cost': 20,
+                              'enable': True},}},}
+
+
 class SimpleSwitchStp(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_0.OFP_VERSION]
-    _CONTEXTS = {'stp': stp.Stp}
+    _CONTEXTS = {'stp_lib': stp_lib.Stp}
 
     def __init__(self, *args, **kwargs):
         super(SimpleSwitchStp, self).__init__(*args, **kwargs)
         self.mac_to_port = {}
+        self.stp = kwargs['stp_lib']
+        self.stp.set_config(STP_CONFIG)
 
     def add_flow(self, datapath, in_port, dst, actions):
         ofproto = datapath.ofproto
@@ -75,7 +126,7 @@ class SimpleSwitchStp(app_manager.RyuApp):
             command=ofproto.OFPFC_DELETE)
         datapath.send_msg(mod)
 
-    @set_ev_cls(stp.EventPacketIn, stp.STP_EV_DISPATCHER)
+    @set_ev_cls(stp_lib.EventPacketIn, stp_lib.STP_EV_DISPATCHER)
     def packet_in_handler(self, ev):
         msg = ev.msg
         datapath = msg.datapath
@@ -86,6 +137,7 @@ class SimpleSwitchStp(app_manager.RyuApp):
         dpid = datapath.id
         self.mac_to_port.setdefault(dpid, {})
 
+        #TODO:
         #self.logger.info("packet in %s %s %s %s",
         #                 dpid, haddr_to_str(src), haddr_to_str(dst),
         #                 msg.in_port)
@@ -126,11 +178,11 @@ class SimpleSwitchStp(app_manager.RyuApp):
         else:
             self.logger.info("Illeagal port state %s %s", port_no, reason)
 
-        # for STP(802.1D spanning tree)
-        stp_port_state = msg.desc.state & ofproto.OFPPS_STP_MASK
-
-        if (stp_port_state == ofproto.OFPPS_STP_BLOCK
-                or stp_port_state == ofproto.OFPPS_STP_LISTEN):
-            if dp.id in self.mac_to_port:
-                del self.mac_to_port[dp.id]
-            self.delete_flow(dp)
+    @set_ev_cls(stp_lib.EventTopologyChange, stp_lib.STP_EV_DISPATCHER)
+    def _topology_change_handler(self, ev):
+        dp = ev.dp
+        self.logger.debug("[dpid=%s] Receive topology change event.",
+                          dpid_lib.dpid_to_str(dp.id))
+        if dp.id in self.mac_to_port:
+            del self.mac_to_port[dp.id]
+        self.delete_flow(dp)
