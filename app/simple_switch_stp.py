@@ -161,23 +161,6 @@ class SimpleSwitchStp(app_manager.RyuApp):
             actions=actions)
         datapath.send_msg(out)
 
-    @set_ev_cls(ofp_event.EventOFPPortStatus, MAIN_DISPATCHER)
-    def _port_status_handler(self, ev):
-        msg = ev.msg
-        reason = msg.reason
-        port_no = msg.desc.port_no
-        dp = msg.datapath
-        ofproto = dp.ofproto
-
-        if reason == ofproto.OFPPR_ADD:
-            self.logger.info("port added %s", port_no)
-        elif reason == ofproto.OFPPR_DELETE:
-            self.logger.info("port deleted %s", port_no)
-        elif reason == ofproto.OFPPR_MODIFY:
-            self.logger.info("port modified %s", port_no)
-        else:
-            self.logger.info("Illeagal port state %s %s", port_no, reason)
-
     @set_ev_cls(stp_lib.EventTopologyChange, stp_lib.STP_EV_DISPATCHER)
     def _topology_change_handler(self, ev):
         dp = ev.dp
