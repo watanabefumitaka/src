@@ -16,10 +16,12 @@
 
 #TODO: config comment
 #TODO: port cost comment
-#TODO: link up/ port add/ port delete
+#TODO: config Disable check
+#TODO: EventPacketIn
 
 
 import logging
+import eventlet
 import greenlet
 
 from ryu.base import app_manager
@@ -119,6 +121,9 @@ class Stp(app_manager.RyuApp):
     def dispacher_change(self, ev):
         assert ev.datapath is not None
         if ev.state == handler.MAIN_DISPATCHER:
+            #TODO:
+            #if ev.datapath.id != 3:
+            #    self._register_bridge(ev.datapath)
             self._register_bridge(ev.datapath)
         elif ev.state == handler.DEAD_DISPATCHER:
             self._unregister_bridge(ev.datapath.id)
@@ -138,7 +143,7 @@ class Stp(app_manager.RyuApp):
 
     def _unregister_bridge(self, dp_id):
         if dp_id in self._BRIDGE_LIST:
-            self._BRIDGE_LIST[dp_id].stop()
+            self._BRIDGE_LIST[dp_id].delete()
             del self._BRIDGE_LIST[dp_id]
             self.logger.info('Leave stp bridge.',
                              extra={'dpid': dpid_to_str(dp_id)})
@@ -150,25 +155,29 @@ class Stp(app_manager.RyuApp):
             bridge.packet_in_handler(ev.msg)
 
     @set_ev_cls(ofp_event.EventOFPPortStatus, handler.MAIN_DISPATCHER)
-    def _port_status_handler(self, ev):
+    def port_status_handler(self, ev):
         ofproto = ev.msg.datapath.ofproto
         reason = ev.msg.reason
         link_down_flg = ev.msg.desc.state & 0b1
         port_no = ev.msg.desc.port_no
+        dp = ev.msg.datapath
 
         #TODO:
-        dpid = {'dpid': dpid_to_str(ev.msg.datapath.id)}
-        self.logger.info('[port=%d] reason=%d, link_down_flg=%d' %
-                         (ev.msg.desc.port_no, reason, link_down_flg),
+        dpid = {'dpid': dpid_to_str(dp.id)}
+        stp_port_state = ev.msg.desc.state & ofproto.OFPPS_STP_MASK
+        state = {ofproto.OFPPS_STP_BLOCK: 'BLOCK',
+                 ofproto.OFPPS_STP_LISTEN: 'LISTEN',
+                 ofproto.OFPPS_STP_LEARN: 'LEARN',
+                 ofproto.OFPPS_STP_FORWARD: 'FORWARD'}
+        self.logger.info('[port=%d] reason=%d, link_down_flg=%d, stp_state=%s' %
+                         (ev.msg.desc.port_no, reason, link_down_flg, state[stp_port_state]),
                          extra=dpid)
-        #stp_port_state = ev.msg.desc.state & ofproto.OFPPS_STP_MASK
-        #print format(stp_port_state, 'b')
 
-        if ev.msg.datapath.id in self._BRIDGE_LIST:
-            bridge = self._BRIDGE_LIST[ev.msg.datapath.id]
+        if dp.id in self._BRIDGE_LIST:
+            bridge = self._BRIDGE_LIST[dp.id]
 
             if reason is ofproto.OFPPR_ADD:
-                bridge.port_add(port_no)
+                bridge.port_add(dp.ports[port_no])
             elif reason is ofproto.OFPPR_DELETE:
                 bridge.port_delete(port_no)
             else:
@@ -253,62 +262,75 @@ class Bridge(object):
                                   values['hello_time'],
                                   values['fwd_delay'])
         # Root bridge data
-        self.root_id = None
-        self.root_times = None
+        self.root_priority = Priority(self.bridge_id, 0, None, None)
+        self.root_times = self.bridge_times
         # Ports
         self.ports = {}
-        ports_conf = config.get('ports', {})
+        self.ports_conf = config.get('ports', {})
         for port_data in dp.ports.values():
             if port_data.port_no <= MAX_PORT_NO:
-                port_conf = (ports_conf.get(port_data.port_no, {})
-                             if ports_conf else {})
+                port_conf = self.ports_conf.get(port_data.port_no, {})
                 self.ports[port_data.port_no] = Port(dp, logger,
                                                      send_ev_func,
                                                      self.init_spanning_tree,
                                                      port_conf,
                                                      self.bridge_id,
+                                                     self.bridge_times,
                                                      port_data,
                                                      10)  #TODO: path_cost
-        self.init_spanning_tree()
 
     @property
     def is_root_bridge(self):
-        return bool(self.bridge_id.value == self.root_id.root_id.value)
+        return bool(self.bridge_id.value == self.root_priority.root_id.value)
 
     def init_spanning_tree(self):
         """ Initialize all port and become a root bridge. """
-        self.stop()
-        self.root_id = Priority(self.bridge_id, 0, None, None)
+        [port.down(PORT_STATE_BLOCKING, msg_init=True)
+         for port in self.ports.values()]
+
+        self.root_priority = Priority(self.bridge_id, 0, None, None)
         self.root_times = self.bridge_times
-        for port in self.ports.values():
-            port.change_role(DESIGNATED_PORT)
-            port.port_priority = self.root_id
-            port.port_times = self.root_times
-            port.msg_priority = None
-            port.msg_times = None
-        self.start()
-        self.logger.info('Become a root bridge.', extra=self.dpid_str)
 
-    def start(self):
-        [port.start() for port in self.ports.values()]
+        [port.up(DESIGNATED_PORT,
+                 self.root_priority, self.root_times)
+         for port in self.ports.values()]
 
-    def stop(self):
-        [port.stop() for port in self.ports.values()]
+        self.logger.info('Root bridge.', extra=self.dpid_str)
 
-    def port_add(self, port_no):
+    def delete(self):
+        [port.delete() for port in self.ports.values()]
+
+    def port_add(self, port):
         #TODO:
-        pass
+        if port.port_no <= MAX_PORT_NO:
+            port_conf = self.ports_conf.get(port.port_no, {})
+            self.ports[port.port_no] = Port(self.dp, self.logger,
+                                            send_ev_func,
+                                            self.init_spanning_tree,
+                                            port_conf,
+                                            self.bridge_id,
+                                            self.bridge_times,
+                                            port,
+                                            10)  #TODO: path_cost
 
     def port_delete(self, port_no):
-        self.ports[port_no].stop()
+        self.link_down(port_no)
+        self.ports[port_no].delete()
         del self.ports[port_no]
 
     def link_up(self, port_no):
-        self.ports[port_no].link_up(self.root_id, self.root_times)
+        port = self.ports[port_no]
+        port.up(DESIGNATED_PORT,
+                self.root_priority, self.root_times)
 
     def link_down(self, port_no):
-        init_stp_flg = self.ports[port_no].link_down()
-        if init_stp_flg:
+        port = self.ports[port_no]
+
+        if (port.role is DESIGNATED_PORT
+                or port.role is NON_DESIGNATED_PORT):
+            port.down(PORT_STATE_DISABLE, msg_init=True)
+
+        elif port.role is ROOT_PORT:
             self.init_spanning_tree()
             #TODO: throw topology change event ?
 
@@ -344,9 +366,10 @@ class Bridge(object):
                 self.send_event(EventTopologyChange(self.dp))
 
             if rcv_info is SUPERIOR:
-                self.stop()
+                #TODO:
+                self.logger.info('[port=%d] receive superiorBPDU.', msg.in_port,
+                                 extra=self.dpid_str)
                 self._spanning_tree_algorithm()  # Re-caluculation of STP
-                self.start()
                 self._transmit_tcn_bpdu()
 
             #TODO: Root port only ?
@@ -370,69 +393,96 @@ class Bridge(object):
             """ Receive Rst BPDU. """
             #TODO:
             pass
-        else:
-            """ Receive non BPDU packet.
-                 - Throw EventPacketIn. """
-            self.send_event(EventPacketIn(msg))
+        #TODO:
+        #else:
+        #    """ Receive non BPDU packet.
+        #         - Throw EventPacketIn. """
+        #    self.send_event(EventPacketIn(msg))
 
     def _spanning_tree_algorithm(self):
-        root_port = self._select_root_bridge()
-        self._update_tree_roles(root_port)
+        """ Update tree roles.
+             - Root bridge:
+                all port is DesignatedPort.
+             - Non root bridge:
+                select one RootPort and some DesignatedPort,
+                and the other port is set to NonDesignatedPort."""
+        [port.down(PORT_STATE_BLOCKING, msg_init=False)
+         for port in self.ports.values()]
 
-    def _select_root_bridge(self):
-        """ Select most superior bridge as a root bridge. """
+        root_port = self._select_root_port()
+
+        if root_port is None:
+            # My bridge is a root bridge.
+            self.logger.info('Root bridge.', extra=self.dpid_str)
+            [port.up(DESIGNATED_PORT,
+                     self.root_priority, self.root_times)
+             for port in self.ports.values()
+             if port.state is not PORT_STATE_DISABLE]
+        else:
+            # Other bridge is a root bridge.
+            self.logger.info('Non root bridge.', extra=self.dpid_str)
+            root_port.up(ROOT_PORT,
+                         self.root_priority, self.root_times)
+            selected_ports = [root_port]
+
+            d_ports = self._select_designated_port(root_port)
+            [port.up(DESIGNATED_PORT,
+                     self.root_priority, self.root_times)
+             for port in d_ports]
+            selected_ports.extend(d_ports)
+
+            [port.up(NON_DESIGNATED_PORT,
+                     self.root_priority, self.root_times)
+             for port in self.ports.values()
+             if (port not in selected_ports
+                     and port.state is not PORT_STATE_DISABLE)]
+
+    def _select_root_port(self):
+        self.root_priority = Priority(self.bridge_id, 0, None, None)
+        self.root_times = self.bridge_times
         root_port = None
+
         for port in self.ports.values():
-            if port.msg_priority is None:
+            root_msg = self.root_priority
+            port_msg = port.msg_priority
+            if port.state is PORT_STATE_DISABLE or port_msg is None:
                 continue
-            if (not root_port or (port.msg_priority.root_id.value
-                                  < root_port.msg_priority.root_id.value)):
+            if root_msg.root_id.value > port_msg.root_id.value:
+                result = SUPERIOR
+            elif root_msg.root_id.value == port_msg.root_id.value:
+                result = Stp.compare_root_path(port_msg.root_path_cost,
+                                               root_msg.root_path_cost,
+                                               port_msg.designated_bridge_id,
+                                               root_msg.designated_bridge_id,
+                                               port_msg.designated_port_id,
+                                               root_msg.designated_port_id)
+            else:
+                result = INFERIOR
+
+            if result is SUPERIOR:
+                self.root_priority = port.msg_priority
+                self.root_times = port.msg_times
                 root_port = port
 
-        superior_root_id = root_port.msg_priority.root_id.value
-        if self.bridge_id.value <= superior_root_id:
-            # My bridge is the root bridge.
-            self.root_id = Priority(self.bridge_id, 0, None, None)
-            self.root_times = self.bridge_times
-        else:
-            # Other bridge is the root bridge.
-            if self.is_root_bridge:
-                self.logger.info('Become a non root bridge',
-                                 extra=self.dpid_str)
-            self.root_id = root_port.msg_priority
-            self.root_times = root_port.msg_times
-
         for port in self.ports.values():
-            port.port_priority = self.root_id
+            port.port_priority = self.root_priority
             port.port_times = self.root_times
 
         return root_port
 
-    def _update_tree_roles(self, root_port):
-        """ Update tree roles.
-             Select one RootPort and some DesignatedPort,
-             and the other port is set to NonDesignatedPort."""
-        if self.is_root_bridge:
-            [port.change_role(DESIGNATED_PORT)
-             for port in self.ports.values()]
+    def _select_designated_port(self, root_port):
+        d_ports = []
+        root_msg = root_port.msg_priority
 
-        else:
-            root_port.change_role(ROOT_PORT)
-            selected_ports = [root_port.data.port_no]
-
-            for port in self.ports.values():
-                if (port.state is PORT_STATE_DISABLE
-                        or port.data.port_no == root_port.data.port_no):
-                    continue
-
-                port_msg = port.msg_priority
-                root_msg = root_port.msg_priority
-                if (port_msg is None or
-                        (port_msg.root_id.value != root_msg.root_id.value)):
-                    port.change_role(DESIGNATED_PORT)
-                    selected_ports.append(port.data.port_no)
-                    continue
-
+        for port in self.ports.values():
+            port_msg = port.msg_priority
+            if (port.state is PORT_STATE_DISABLE
+                    or port.data.port_no == root_port.data.port_no):
+                continue
+            if (port_msg is None or
+                    (port_msg.root_id.value != root_msg.root_id.value)):
+                d_ports.append(port)
+            else:
                 result = Stp.compare_root_path(root_msg.root_path_cost,
                                                (port_msg.root_path_cost
                                                 - port.path_cost),
@@ -441,12 +491,9 @@ class Bridge(object):
                                                port.port_id,
                                                port_msg.designated_port_id)
                 if result is SUPERIOR:
-                    port.change_role(DESIGNATED_PORT)
-                    selected_ports.append(port.data.port_no)
+                    d_ports.append(port)
 
-            [port.change_role(NON_DESIGNATED_PORT)
-             for port in self.ports.values()
-             if port.data.port_no not in selected_ports]
+        return d_ports
 
     def _transmit_tc_bpdu(self):
         [port.transmit_tc_bpdu() for port in self.ports.values()]
@@ -467,7 +514,7 @@ class Bridge(object):
 
 class Port(object):
     def __init__(self, dp, logger, send_ev_func, timeout_func,
-                 config, bridge_id, data, path_cost):
+                 config, bridge_id, bridge_times, data, path_cost):
         super(Port, self).__init__()
         self.dp = dp
         self.logger = logger
@@ -502,125 +549,118 @@ class Port(object):
         # Receive BPDU data
         self.msg_priority = None
         self.msg_times = None
-        # State machine thread
-        self.state_machine = PortThread(self._state_machine)
-        self.state_event = None
         # BPDU handling threads
         self.send_bpdu_thread = PortThread(self._transmit_config_bpdu)
+        self.wait_bpdu_thread = PortThread(self._wait_bpdu_timer)
         self.send_tc_thread = PortThread(self._transmit_tc_bpdu)
         self.send_tcn_thread = PortThread(self._transmit_tcn_bpdu)
-        self.wait_bpdu_thread = PortThread(self._wait_bpdu_timer)
         self.send_tc_flg = None
         self.send_tcn_flg = None
         self.timer_event = None
+        # State machine thread
+        self.state_event = None
+        self.state_lock = eventlet.semaphore.Semaphore()
+        self.state_machine = PortThread(self._state_machine)
 
-    def start(self):
-        if self.state is not PORT_STATE_DISABLE:
-            self._change_status(PORT_STATE_LISTENING)
+        self.up(DESIGNATED_PORT,
+                Priority(bridge_id, 0, None, None), bridge_times)
 
-        self.send_tc_flg = False
-        self.send_tcn_flg = False
         self.state_machine.start()
-        self.logger.debug(('[port=%d] Start port state machine.'
-                           % self.data.port_no), extra=self.dpid_str)
+        self.logger.debug('[port=%d] Start port state machine.',
+                          self.data.port_no, extra=self.dpid_str)
 
-    def stop(self):
-        self.role = None
-        if self.state is not PORT_STATE_DISABLE:
-            self._change_status(PORT_STATE_BLOCKING)
-
-        self.send_tcn_flg = False
-
+    def delete(self):
+        self.state_lock.release()
         self.state_machine.stop()
         self.send_bpdu_thread.stop()
         self.wait_bpdu_thread.stop()
         self.send_tc_thread.stop()
         self.send_tcn_thread.stop()
-
         if self.state_event is not None:
             self.state_event.set()
             self.state_event = None
         if self.timer_event is not None:
             self.timer_event.set()
             self.timer_event = None
-
         self.logger.debug(('[port=%d] Stop port threads.'
                            % self.data.port_no), extra=self.dpid_str)
 
-    def link_up(self, root_id, root_times):
-        """ Initialize port. """
+    def up(self, role, root_priority, root_times):
+        self.port_priority = root_priority
+        self.port_times = root_times
+
+        self._change_role(role)
         if self.config.get('enable', True):
-            self.port_priority = root_id
-            self.port_times = root_times
+            self._change_status(PORT_STATE_LISTENING)
+        else:
+            self._change_status(PORT_STATE_DISABLE)
+
+    def down(self, state, msg_init=False):
+        assert (state is PORT_STATE_DISABLE
+                    or state is PORT_STATE_BLOCKING)
+        if not self.config.get('enable', True):
+            return
+
+        if msg_init:
             self.msg_priority = None
             self.msg_times = None
-            self.change_role(DESIGNATED_PORT)
-            self._change_status(PORT_STATE_LISTENING)
 
-    def link_down(self):
-        """ DesignatedPort or NonDesignatedPort: port state -> Disable
-            RootPort: re-calculation of Spanning Tree """
-        init_stp_flg = False
-        if (self.role is DESIGNATED_PORT
-                or self.role is NON_DESIGNATED_PORT):
-            self._change_status(PORT_STATE_DISABLE)
-        else:
-            assert self.role is ROOT_PORT
-            init_stp_flg = True
-        return init_stp_flg
+        self._change_role(DESIGNATED_PORT)
+        self._change_status(state)
 
     def _state_machine(self):
+        self.state_lock.acquire()
+
         while True:
-            try:
-                # for log message
-                role_str = {ROOT_PORT: 'ROOT_PORT          ',
-                            DESIGNATED_PORT: 'DESIGNATED_PORT    ',
-                            NON_DESIGNATED_PORT: 'NON_DESIGNATED_PORT'}
-                state_str = {PORT_STATE_DISABLE: 'DISABLE',
-                             PORT_STATE_BLOCKING: 'BLOCKING',
-                             PORT_STATE_LISTENING: 'LISTENING',
-                             PORT_STATE_LEARNING: 'LEARNING',
-                             PORT_STATE_FORWARDING: 'FORWARDING'}
-                self.logger.info('[port=%d] %s / %s'
-                                 % (self.data.port_no,
-                                    role_str[self.role],
-                                    state_str[self.state]),
-                                 extra=self.dpid_str)
+            # for log message
+            role_str = {ROOT_PORT: 'ROOT_PORT          ',
+                        DESIGNATED_PORT: 'DESIGNATED_PORT    ',
+                        NON_DESIGNATED_PORT: 'NON_DESIGNATED_PORT'}
+            state_str = {PORT_STATE_DISABLE: 'DISABLE',
+                         PORT_STATE_BLOCKING: 'BLOCKING',
+                         PORT_STATE_LISTENING: 'LISTENING',
+                         PORT_STATE_LEARNING: 'LEARNING',
+                         PORT_STATE_FORWARDING: 'FORWARDING'}
+            self.logger.info('[port=%d] %s / %s', self.data.port_no,
+                             role_str[self.role], state_str[self.state],
+                             extra=self.dpid_str)
 
-                # Change openflow port status.
-                self.ofctl.set_port_status(self.data, self.state)
+            # Change openflow port status.
+            self.ofctl.set_port_status(self.data, self.state)
 
-                if self.state is PORT_STATE_LISTENING:
-                    self.send_bpdu_thread.start()
-                if (self.state is PORT_STATE_DISABLE
-                        or self.state is PORT_STATE_BLOCKING):
-                    self.send_bpdu_thread.stop()
-                    self.send_tc_thread.stop()
-                    self.send_tcn_thread.stop()
-                if self.state is PORT_STATE_DISABLE:
-                    self.wait_bpdu_thread.stop()
+            if (self.state is PORT_STATE_DISABLE
+                    or self.state is PORT_STATE_BLOCKING):
+                self.send_tc_flg = False
+                self.send_tcn_flg = False
+                self.send_bpdu_thread.stop()
+                self.send_tc_thread.stop()
+                self.send_tcn_thread.stop()
+            elif self.state is PORT_STATE_LISTENING:
+                self.send_bpdu_thread.start()
 
-                # Sleep until timer is exceeded
-                #  or self._change_status() is called.
-                self.state_event = hub.Event()
-                timer = self._get_timer()
-                if timer:
-                    timeout = hub.Timeout(timer)
-                    try:
-                        self.state_event.wait()
-                    except hub.Timeout as t:
-                        if t is not timeout:
-                            raise  #TODO: not my timeout
-                        self.state = self._get_next_state()
-                    finally:
-                        timeout.cancel()
-                else:
+            # Sleep until timer is exceeded
+            #  or self._change_status() is called.
+            self.state_event = hub.Event()
+            timer = self._get_timer()
+            if timer:
+                timeout = hub.Timeout(timer)
+                try:
+                    self.state_lock.release()
                     self.state_event.wait()
-                self.state_event = None
-
-            except KeyError:
-                # Under execution of Port.stop() processing.
-                return
+                    self.state_lock.acquire()
+                except hub.Timeout as t:
+                    if t is not timeout:
+                        raise  #TODO: not my timeout
+                    self.state_lock.acquire()
+                    self.state = self._get_next_state()
+                finally:
+                    timeout.cancel()
+            else:
+                self.state_lock.release()
+                self.state_event.wait()
+                self.state_lock.acquire()
+            
+            self.state_event = None
 
     def _get_timer(self):
         timer = {PORT_STATE_DISABLE: None,
@@ -649,12 +689,17 @@ class Port(object):
                 return PORT_STATE_BLOCKING
 
     def _change_status(self, new_state):
+        self.state_lock.acquire()
+
         self.state = new_state
-        if self.state_event:
+        if self.state_event is not None:
             self.state_event.set()
             self.state_event = None
 
-    def change_role(self, new_role):
+        self.state_lock.release()
+        hub.sleep(0)  # For thread switching.
+
+    def _change_role(self, new_role):
         if self.role is new_role:
             return
         self.role = new_role
@@ -709,6 +754,7 @@ class Port(object):
         if rcv_info is SUPERIOR:
             self.msg_priority = msg_priority
             self.msg_times = msg_times
+
         if ((rcv_info is SUPERIOR or rcv_info is REPEATED)
                 and (self.role is ROOT_PORT
                         or self.role is NON_DESIGNATED_PORT)):

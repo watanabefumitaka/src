@@ -24,6 +24,8 @@ from ryu.controller.handler import set_ev_cls
 from ryu.ofproto import ofproto_v1_0
 from ryu.lib import dpid as dpid_lib
 from ryu.lib.mac import haddr_to_str
+from ryu.lib.packet import bpdu
+from ryu.lib.packet import packet
 
 #TODO:
 #from ryu.lib import stp_lib
@@ -41,7 +43,7 @@ import stp_lib
 # Sample of stp_lib config
 #  - please refer to stp_lib.Stp.set_config() for details.
 STP_CONFIG = {dpid_lib.str_to_dpid('0000000000000001'):
-               {'bridge': {'priority': 0x8000,
+               {'bridge': {'priority': 0xa000,
                            'max_age': 20,
                            'hello_time': 2,
                            'fwd_delay': 15},
@@ -71,7 +73,7 @@ STP_CONFIG = {dpid_lib.str_to_dpid('0000000000000001'):
                               'enable': True},}},
 
               dpid_lib.str_to_dpid('0000000000000003'):
-               {'bridge': {'priority': 0xa000,
+               {'bridge': {'priority': 0x8000,
                            'max_age': 20,
                            'hello_time': 2,
                            'fwd_delay': 15},
@@ -126,11 +128,20 @@ class SimpleSwitchStp(app_manager.RyuApp):
             command=ofproto.OFPFC_DELETE)
         datapath.send_msg(mod)
 
-    @set_ev_cls(stp_lib.EventPacketIn, stp_lib.STP_EV_DISPATCHER)
+    #TODO:
+    #@set_ev_cls(stp_lib.EventPacketIn, stp_lib.STP_EV_DISPATCHER)
+    @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
         msg = ev.msg
         datapath = msg.datapath
         ofproto = datapath.ofproto
+
+        #TODO: comment
+        pkt = packet.Packet(msg.data)
+        if (bpdu.ConfigurationBPDUs in pkt
+                or bpdu.TopologyChangeNotificationBPDUs in pkt
+                    or bpdu.RstBPDUs in pkt):
+            return
 
         dst, src, _eth_type = struct.unpack_from('!6s6sH', buffer(msg.data), 0)
 
