@@ -1,10 +1,10 @@
-# Copyright (C) 2011 Nippon Telegraph and Telephone Corporation.
+# Copyright (C) 2013 Nippon Telegraph and Telephone Corporation.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#    http://www.apache.org/licenses/LICENSE-2.0
+# http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -13,79 +13,65 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
 import struct
 
 from ryu.base import app_manager
-from ryu.controller import mac_to_port
-from ryu.controller import ofp_event
-from ryu.controller.handler import MAIN_DISPATCHER
 from ryu.controller.handler import set_ev_cls
 from ryu.ofproto import ofproto_v1_0
 from ryu.lib import dpid as dpid_lib
-from ryu.lib.mac import haddr_to_str
-from ryu.lib.packet import bpdu
-from ryu.lib.packet import packet
 
 #TODO:
 #from ryu.lib import stp_lib
 import stp_lib
 
 
-# TODO: we should split the handler into two parts, protocol
-# independent and dependant parts.
-
-# TODO: can we use dpkt python library?
-
-# TODO: we need to move the followings to something like db
-
-
-# Sample of stp_lib config
-#  - please refer to stp_lib.Stp.set_config() for details.
+#TODO: delete
 STP_CONFIG = {dpid_lib.str_to_dpid('0000000000000001'):
-               {'bridge': {'priority': 0xa000,
-                           'max_age': 20,
-                           'hello_time': 2,
-                           'fwd_delay': 15},
-                'ports': {1: {'priority': 0x80,
-                              'path_cost': 20,
-                              'enable': True},
-                          2: {'priority': 0x80,
-                              'path_cost': 20,
-                              'enable': True},
-                          3: {'priority': 0x80,
-                              'path_cost': 20,
-                              'enable': True},}},
+              {'bridge': {'priority': 0xa000,
+                          'max_age': 20,
+                          'hello_time': 2,
+                          'fwd_delay': 15},
+               'ports': {1: {'priority': 0x80,
+                             'path_cost': 20,
+                             'enable': True},
+                         2: {'priority': 0x80,
+                             'path_cost': 20,
+                             'enable': True},
+                         3: {'priority': 0x80,
+                             'path_cost': 20,
+                             'enable': True}}},
 
               dpid_lib.str_to_dpid('0000000000000002'):
-               {'bridge': {'priority': 0x9000,
-                           'max_age': 20,
-                           'hello_time': 2,
-                           'fwd_delay': 15},
-                'ports': {1: {'priority': 0x80,
-                              'path_cost': 20,
-                              'enable': True},
-                          2: {'priority': 0x80,
-                              'path_cost': 20,
-                              'enable': True},
-                          3: {'priority': 0x80,
-                              'path_cost': 20,
-                              'enable': True},}},
+              {'bridge': {'priority': 0x9000,
+                          'max_age': 20,
+                          'hello_time': 2,
+                          'fwd_delay': 15},
+               'ports': {1: {'priority': 0x80,
+                             'path_cost': 20,
+                             'enable': True},
+                         2: {'priority': 0x80,
+                             'path_cost': 20,
+                             'enable': True},
+                         3: {'priority': 0x80,
+                             'path_cost': 20,
+                             'enable': True}}},
 
               dpid_lib.str_to_dpid('0000000000000003'):
-               {'bridge': {'priority': 0x8000,
-                           'max_age': 20,
-                           'hello_time': 2,
-                           'fwd_delay': 15},
-                'ports': {1: {'priority': 0x80,
-                              'path_cost': 20,
-                              'enable': True},
-                          2: {'priority': 0x80,
-                              'path_cost': 20,
-                              'enable': True},
-                          3: {'priority': 0x80,
-                              'path_cost': 20,
-                              'enable': True},}},}
+              {'bridge': {'priority': 0x8000,
+                          'max_age': 20,
+                          'hello_time': 2,
+                          'fwd_delay': 15},
+               'ports': {1: {'priority': 0x80,
+                             'path_cost': 20,
+                             'enable': True},
+                         2: {'priority': 0x80,
+                             'path_cost': 20,
+                             'enable': True},
+                         3: {'priority': 0x80,
+                             'path_cost': 20,
+                             'enable': True}}},
+              dpid_lib.str_to_dpid('0000000000000004'):
+              {'bridge': {'priority': 0xb000}}}
 
 
 class SimpleSwitchStp(app_manager.RyuApp):
@@ -96,7 +82,20 @@ class SimpleSwitchStp(app_manager.RyuApp):
         super(SimpleSwitchStp, self).__init__(*args, **kwargs)
         self.mac_to_port = {}
         self.stp = kwargs['stp_lib']
-        self.stp.set_config(STP_CONFIG)
+
+        # Sample of stp_lib config
+        #  - please refer to stp_lib.Stp.set_config() for details.
+        """
+        config = {dpid_lib.str_to_dpid('0000000000000001'):
+                     {'bridge': {'priority': 0x8000,
+                                 'max_age': 10},
+                      'ports': {1: {'priority': 0x80},
+                                2: {'priority': 0x90}}},
+                  dpid_lib.str_to_dpid('0000000000000002'):
+                     {'bridge': {'priority': 0x9000}}}
+        self.stp.set_config(config)
+        """
+        self.stp.set_config(STP_CONFIG)  #TODO: delete
 
     def add_flow(self, datapath, in_port, dst, actions):
         ofproto = datapath.ofproto
@@ -128,20 +127,11 @@ class SimpleSwitchStp(app_manager.RyuApp):
             command=ofproto.OFPFC_DELETE)
         datapath.send_msg(mod)
 
-    #TODO:
-    #@set_ev_cls(stp_lib.EventPacketIn, stp_lib.STP_EV_DISPATCHER)
-    @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
+    @set_ev_cls(stp_lib.EventPacketIn, stp_lib.STP_EV_DISPATCHER)
     def packet_in_handler(self, ev):
         msg = ev.msg
         datapath = msg.datapath
         ofproto = datapath.ofproto
-
-        #TODO: comment
-        pkt = packet.Packet(msg.data)
-        if (bpdu.ConfigurationBPDUs in pkt
-                or bpdu.TopologyChangeNotificationBPDUs in pkt
-                    or bpdu.RstBPDUs in pkt):
-            return
 
         dst, src, _eth_type = struct.unpack_from('!6s6sH', buffer(msg.data), 0)
 
@@ -175,8 +165,12 @@ class SimpleSwitchStp(app_manager.RyuApp):
     @set_ev_cls(stp_lib.EventTopologyChange, stp_lib.STP_EV_DISPATCHER)
     def _topology_change_handler(self, ev):
         dp = ev.dp
-        self.logger.debug("[dpid=%s] Receive topology change event.",
-                          dpid_lib.dpid_to_str(dp.id))
+        dpid_str = dpid_lib.dpid_to_str(ev.dp.id)
+        self.logger.debug("[dpid=%s] Receive topology change event.", dpid_str)
         if dp.id in self.mac_to_port:
             del self.mac_to_port[dp.id]
         self.delete_flow(dp)
+
+        for port_no, state in ev.ports.items():
+            self.logger.debug("[dpid=%s][port=%d] state=%d",
+                              dpid_str, port_no, state)
