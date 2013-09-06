@@ -19,10 +19,11 @@ from ryu.base import app_manager
 from ryu.controller.handler import set_ev_cls
 from ryu.ofproto import ofproto_v1_0
 from ryu.lib import dpid as dpid_lib
+from ryu.lib.mac import haddr_to_str
 
 #TODO:
-#from ryu.lib import stp_lib
-import stp_lib
+#from ryu.lib import stplib
+import stplib
 
 
 #TODO: delete
@@ -76,15 +77,15 @@ STP_CONFIG = {dpid_lib.str_to_dpid('0000000000000001'):
 
 class SimpleSwitchStp(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_0.OFP_VERSION]
-    _CONTEXTS = {'stp_lib': stp_lib.Stp}
+    _CONTEXTS = {'stplib': stplib.Stp}
 
     def __init__(self, *args, **kwargs):
         super(SimpleSwitchStp, self).__init__(*args, **kwargs)
         self.mac_to_port = {}
-        self.stp = kwargs['stp_lib']
+        self.stp = kwargs['stplib']
 
-        # Sample of stp_lib config
-        #  - please refer to stp_lib.Stp.set_config() for details.
+        # Sample of stplib config
+        #  - please refer to stplib.Stp.set_config() for details.
         """
         config = {dpid_lib.str_to_dpid('0000000000000001'):
                      {'bridge': {'priority': 0x8000,
@@ -127,7 +128,7 @@ class SimpleSwitchStp(app_manager.RyuApp):
             command=ofproto.OFPFC_DELETE)
         datapath.send_msg(mod)
 
-    @set_ev_cls(stp_lib.EventPacketIn, stp_lib.STP_EV_DISPATCHER)
+    @set_ev_cls(stplib.EventPacketIn, stplib.STP_EV_DISPATCHER)
     def packet_in_handler(self, ev):
         msg = ev.msg
         datapath = msg.datapath
@@ -138,10 +139,9 @@ class SimpleSwitchStp(app_manager.RyuApp):
         dpid = datapath.id
         self.mac_to_port.setdefault(dpid, {})
 
-        #TODO:
-        #self.logger.info("packet in %s %s %s %s",
-        #                 dpid, haddr_to_str(src), haddr_to_str(dst),
-        #                 msg.in_port)
+        self.logger.debug("packet in %s %s %s %s",
+                          dpid, haddr_to_str(src), haddr_to_str(dst),
+                          msg.in_port)
 
         # learn a mac address to avoid FLOOD next time.
         self.mac_to_port[dpid][src] = msg.in_port
@@ -162,15 +162,24 @@ class SimpleSwitchStp(app_manager.RyuApp):
             actions=actions)
         datapath.send_msg(out)
 
-    @set_ev_cls(stp_lib.EventTopologyChange, stp_lib.STP_EV_DISPATCHER)
+    @set_ev_cls(stplib.EventTopologyChange, stplib.STP_EV_DISPATCHER)
     def _topology_change_handler(self, ev):
         dp = ev.dp
-        dpid_str = dpid_lib.dpid_to_str(ev.dp.id)
-        self.logger.debug("[dpid=%s] Receive topology change event.", dpid_str)
+        dpid_str = dpid_lib.dpid_to_str(dp.id)
+        msg = 'Receive topology change event. Flush MAC table.'
+        self.logger.debug("[dpid=%s] %s", dpid_str, msg)
+
         if dp.id in self.mac_to_port:
             del self.mac_to_port[dp.id]
         self.delete_flow(dp)
 
-        for port_no, state in ev.ports.items():
-            self.logger.debug("[dpid=%s][port=%d] state=%d",
-                              dpid_str, port_no, state)
+    @set_ev_cls(stplib.EventPortStateChange, stplib.STP_EV_DISPATCHER)
+    def _port_state_change_handler(self, ev):
+        dpid_str = dpid_lib.dpid_to_str(ev.dp.id)
+        of_state = {ofproto_v1_0.OFPPS_LINK_DOWN: 'DISABLE',
+                    ofproto_v1_0.OFPPS_STP_BLOCK: 'BLOCK',
+                    ofproto_v1_0.OFPPS_STP_LISTEN: 'LISTEN',
+                    ofproto_v1_0.OFPPS_STP_LEARN: 'LEARN',
+                    ofproto_v1_0.OFPPS_STP_FORWARD: 'FORWARD'}
+        self.logger.debug("[dpid=%s][port=%d] state=%s",
+                          dpid_str, ev.port_no, of_state[ev.port_state])
